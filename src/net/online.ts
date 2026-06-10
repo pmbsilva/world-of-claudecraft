@@ -1,6 +1,6 @@
 // Online play: REST auth client + WebSocket world mirror.
 
-import { NPCS, abilitiesKnownAt } from '../sim/data';
+import { NPCS, QUESTS, abilitiesKnownAt } from '../sim/data';
 import { computeQuestState, ResolvedAbility } from '../sim/sim';
 import {
   Entity, EquipSlot, InvSlot, MoveInput, PlayerClass, QuestProgress, QuestState, SimEvent,
@@ -364,10 +364,21 @@ export class ClientWorld implements IWorld {
   pickUpObject(id: number): void {
     this.cmd({ cmd: 'pickup', id });
   }
+  // Quest commands update local state optimistically so the dialog can't be
+  // re-used in the window before the next server snapshot lands. The server
+  // remains authoritative; the following snapshot overwrites this state.
   acceptQuest(questId: string): void {
+    const quest = QUESTS[questId];
+    if (quest && !this.questLog.has(questId) && !this.questsDone.has(questId)) {
+      this.questLog.set(questId, { questId, counts: quest.objectives.map(() => 0), state: 'active' });
+    }
     this.cmd({ cmd: 'accept', quest: questId });
   }
   turnInQuest(questId: string): void {
+    if (this.questLog.get(questId)?.state === 'ready') {
+      this.questLog.delete(questId);
+      this.questsDone.add(questId);
+    }
     this.cmd({ cmd: 'turnin', quest: questId });
   }
   abandonQuest(questId: string): void {

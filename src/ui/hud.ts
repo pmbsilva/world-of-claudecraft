@@ -1,11 +1,12 @@
 import { formatMoney, ResolvedAbility } from '../sim/sim';
 import type { IWorld } from '../world_api';
 import { Renderer } from '../render/renderer';
-import { ABILITIES, CLASSES, ITEMS, MOBS, NPCS, QUESTS, ZONE_NAME } from '../sim/data';
+import { ABILITIES, CLASSES, DUNGEON_X_THRESHOLD, ITEMS, MOBS, NPCS, QUESTS, TOWN_RADIUS, ZONE_NAME } from '../sim/data';
 import type { InvSlot } from '../sim/types';
 import { AbilityEffect, Entity, GCD, ItemDef, SimEvent, dist2d, xpForLevel, MAX_LEVEL, MELEE_RANGE } from '../sim/types';
 import { terrainHeight, WATER_LEVEL, roadDistance } from '../sim/world';
 import { audio } from '../game/audio';
+import { music } from '../game/music';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => document.querySelector(sel) as T;
 
@@ -30,6 +31,7 @@ export class Hud {
   private mapBg: HTMLCanvasElement | null = null;
   private openLootMobId: number | null = null;
   private openVendorNpcId: number | null = null;
+  private openGossipNpcId: number | null = null;
   private selectedQuestLogId: string | null = null;
   private lastPortraitTarget = -999;
   // trading: locally staged offer, pushed to the server on change
@@ -37,6 +39,7 @@ export class Hud {
   private tradeWasOpen = false;
   private lastTradeSig = '';
   private lastPartySig = '';
+  private lastCombatEventAt = 0;
 
   constructor(private sim: IWorld, private renderer: Renderer) {
     this.buildActionBar();
@@ -47,11 +50,27 @@ export class Hud {
     this.minimapCtx = mm.getContext('2d')!;
     this.minimapBg = this.renderTerrainCanvas(140);
     $('#release-btn').addEventListener('click', () => { this.sim.releaseSpirit(); });
+    // classic WoW: the player interaction menu opens from the target portrait
+    $('#target-frame').addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      const tid = this.sim.player.targetId;
+      const t = tid !== null ? this.sim.entities.get(tid) : null;
+      if (t && t.kind === 'player' && t.id !== this.sim.playerId) {
+        this.openContextMenu(t.id, t.name, (ev as MouseEvent).clientX, (ev as MouseEvent).clientY);
+      }
+    });
     $('#mm-char').addEventListener('click', () => this.toggleChar());
     $('#mm-spell').addEventListener('click', () => this.toggleSpellbook());
     $('#mm-quest').addEventListener('click', () => this.toggleQuestLog());
     $('#mm-map').addEventListener('click', () => this.toggleMap());
     $('#mm-bag').addEventListener('click', () => this.toggleBags());
+    const musicBtn = $('#mm-music');
+    const styleMusicBtn = () => { musicBtn.style.color = music.enabled ? '#ffd100' : '#666'; };
+    styleMusicBtn();
+    musicBtn.addEventListener('click', () => {
+      music.setEnabled(!music.enabled);
+      styleMusicBtn();
+    });
     this.showBanner(ZONE_NAME);
     this.log('Welcome to Eastbrook Vale!', '#ffd100');
     this.log('Find Marshal Redbrook in town — he has work for you.', '#ffd100');
@@ -315,6 +334,18 @@ export class Hud {
 
     $('#death-overlay').style.display = p.dead ? 'flex' : 'none';
 
+    // soundtrack: pick the zone theme and layer in combat percussion.
+    // Combat = a mob is on us, or we traded blows in the last few seconds
+    // (the wire protocol doesn't ship the inCombat flag).
+    let aggroed = false;
+    for (const e of sim.entities.values()) {
+      if (e.kind === 'mob' && !e.dead && e.aggroTargetId === sim.playerId) { aggroed = true; break; }
+    }
+    const inCombat = aggroed || performance.now() - this.lastCombatEventAt < 5000;
+    const zone = p.pos.x > DUNGEON_X_THRESHOLD ? 'dungeon'
+      : Math.hypot(p.pos.x, p.pos.z) < TOWN_RADIUS + 10 ? 'town' : 'wilds';
+    music.update(zone, inCombat);
+
     this.updateQuestTracker();
     this.updatePartyFrames();
     this.updateTradeWindow();
@@ -427,6 +458,11 @@ export class Hud {
         ctx.fillStyle = '#ffd100';
         ctx.font = 'bold 11px Georgia';
         ctx.fillText(hasReady ? '?' : hasAvail ? '!' : '•', mx - 2, my + 3);
+      } else if (e.kind === 'object' && (e.templateId === 'crypt_door' || e.templateId === 'crypt_exit')) {
+        ctx.fillStyle = '#c084ff';
+        ctx.beginPath();
+        ctx.arc(mx, my, 3.5, 0, Math.PI * 2);
+        ctx.fill();
       } else if (e.kind === 'object' && e.lootable) {
         ctx.fillStyle = '#ffe97a';
         ctx.fillRect(mx - 1.5, my - 1.5, 3, 3);
@@ -494,11 +530,26 @@ export class Hud {
     label(0, -3, 'Eastbrook');
     label(-2, 70, 'Wolf Run');
     label(65, 0, 'Boar Meadow');
-    label(-85, 78, 'Mirror Lake');
+    label(-88, 82, 'Mirror Lake');
     label(-60, 4, 'Webwood');
     label(-84, -64, 'Copper Dig');
     label(76, -76, 'Bandit Camp');
-    label(80, 84, 'Fallen Chapel');
+    label(80, 80, 'Fallen Chapel');
+    // dungeon entrance portal
+    {
+      const { mx, my } = toMap(80, 90);
+      ctx.fillStyle = '#c084ff';
+      ctx.beginPath();
+      ctx.arc(mx, my, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#e0c0ff';
+      ctx.font = 'bold 12px Georgia';
+      ctx.strokeText('The Hollow Crypt', mx, my - 9);
+      ctx.fillText('The Hollow Crypt', mx, my - 9);
+      ctx.font = 'bold 13px Georgia';
+      ctx.fillStyle = '#ffe9a0';
+    }
     // npcs
     for (const e of this.sim.entities.values()) {
       if (e.kind !== 'npc') continue;
@@ -534,6 +585,9 @@ export class Hud {
   handleEvents(events: SimEvent[]): void {
     const sim = this.sim;
     for (const ev of events) {
+      // visual effects (swings, projectiles, glows) — for everyone nearby,
+      // not just events involving this player
+      this.renderer.handleEvent(ev);
       switch (ev.type) {
         case 'damage': {
           const src = sim.entities.get(ev.sourceId);
@@ -541,6 +595,7 @@ export class Hud {
           if (!tgt) break;
           const isPlayerSource = ev.sourceId === sim.playerId;
           const isPlayerTarget = ev.targetId === sim.playerId;
+          if (isPlayerSource || isPlayerTarget) this.lastCombatEventAt = performance.now();
           if (ev.kind === 'miss' || ev.kind === 'dodge') {
             this.fct(tgt, ev.kind === 'miss' ? 'Miss' : 'Dodge', isPlayerTarget ? '#bbb' : '#fff', false);
             if (isPlayerSource) {
@@ -553,7 +608,6 @@ export class Hud {
             const color = ev.ability ? '#ffe97a' : '#fff';
             this.fct(tgt, `${ev.amount}${ev.crit ? '!' : ''}`, color, ev.crit);
             this.log(`Your ${ev.ability ?? 'attack'} hits ${tgt.name} for ${ev.amount}${ev.crit ? ' (Critical)' : ''}.`, ev.ability ? '#ffe97a' : '#eee');
-            if (src) this.renderer.triggerAttack(src.id);
             if (ev.school === 'fire') audio.fire();
             else if (ev.school === 'frost') audio.frost();
             else if (ev.school === 'arcane') audio.arcane();
@@ -561,7 +615,6 @@ export class Hud {
           } else if (isPlayerTarget) {
             this.fct(tgt, `-${ev.amount}`, '#ff5544', ev.crit);
             this.log(`${src?.name ?? 'Something'} hits you for ${ev.amount}${ev.crit ? ' (Critical)' : ''}.`, '#ff8877');
-            if (src && src.id !== sim.playerId) this.renderer.triggerAttack(src.id);
             audio.hitTaken();
           }
           break;
@@ -603,7 +656,10 @@ export class Hud {
           break;
         }
         case 'error': this.showError(ev.text); break;
-        case 'questAccepted': audio.questAccept(); break;
+        case 'questAccepted':
+          audio.questAccept();
+          this.refreshGossip();
+          break;
         case 'questProgress': this.log(ev.text, '#dcd29f'); break;
         case 'questReady': {
           const q = QUESTS[ev.questId];
@@ -611,7 +667,10 @@ export class Hud {
           audio.questDone();
           break;
         }
-        case 'questDone': audio.questDone(); break;
+        case 'questDone':
+          audio.questDone();
+          this.refreshGossip();
+          break;
         case 'chat':
           if (ev.channel === 'party') this.log(`[Party] ${ev.from}: ${ev.text}`, '#7fd4ff');
           else this.log(`[${ev.from}]: ${ev.text}`, '#9adcf0');
@@ -725,6 +784,7 @@ export class Hud {
   }
 
   private renderGossip(npc: Entity): void {
+    this.openGossipNpcId = npc.id;
     const el = $('#quest-dialog');
     const def = NPCS[npc.templateId];
     const interesting = npc.questIds.filter((q) => ['available', 'active', 'ready'].includes(this.sim.questState(q)));
@@ -799,7 +859,17 @@ export class Hud {
 
   closeQuestDialog(): void {
     $('#quest-dialog').style.display = 'none';
+    this.openGossipNpcId = null;
     this.hideTooltip();
+  }
+
+  // Re-render the open gossip dialog after quest state changes so completed
+  // quests can never be accepted again from a stale dialog.
+  private refreshGossip(): void {
+    if (this.openGossipNpcId === null || $('#quest-dialog').style.display !== 'block') return;
+    const npc = this.sim.entities.get(this.openGossipNpcId);
+    if (npc) this.renderGossip(npc);
+    else this.closeQuestDialog();
   }
 
   // -------------------------------------------------------------------------

@@ -1,8 +1,9 @@
 import {
   ABILITIES, CAMPS, CLASSES, CRYPT_DOOR_POS, CRYPT_ENTRY, CRYPT_EXIT_OFFSET, CRYPT_SPAWNS,
-  GRAVEYARD_POS, GROUND_OBJECTS, GROUP_XP_BONUS, INSTANCE_SLOT_COUNT, ITEMS, MOBS, NPCS,
-  PLAYER_START, QUESTS, REWARD_ARCHETYPE, abilitiesKnownAt, instanceOrigin,
+  DUNGEON_X_THRESHOLD, GRAVEYARD_POS, GROUND_OBJECTS, GROUP_XP_BONUS, INSTANCE_SLOT_COUNT,
+  ITEMS, MOBS, NPCS, PLAYER_START, QUESTS, REWARD_ARCHETYPE, abilitiesKnownAt, instanceOrigin,
 } from './data';
+import { resolvePosition } from './colliders';
 import { createGroundObject, createMob, createNpc, createPlayer, recalcPlayerStats, PlayerEquipment } from './entity';
 import { Rng } from './rng';
 import { groundHeight, WATER_LEVEL } from './world';
@@ -31,6 +32,12 @@ const DUEL_FORFEIT_DISTANCE = 60;
 const TRADE_RANGE = 10;
 const INSTANCE_EMPTY_TIMEOUT = 300; // seconds before an empty instance resets
 const HUNTER_RANGED_DEADZONE = 8;
+const MAX_CLIMB_SLOPE = 1.5; // rise/run above which a ground move is blocked (cliffs, world rim)
+const SWIM_SURFACE_Y = WATER_LEVEL - 0.75; // body bobs just below the water line
+const SWIM_DEPTH = 0.8; // ground this far under the water line = deep water
+const SWIM_SPEED_MULT = 0.65;
+const DOOR_TRIGGER_RADIUS = 2.0; // walking this close to a dungeon door teleports you
+const BODY_RADIUS = 0.5;
 
 export interface Party {
   id: number;
@@ -171,20 +178,23 @@ export class Sim {
     };
     this.rng = new Rng(cfg.seed);
 
-    // NPCs
+    // NPCs — nudged out of buildings and deep water if their data position is bad
     for (const npcDef of Object.values(NPCS)) {
-      const pos = this.groundPos(npcDef.pos.x, npcDef.pos.z);
-      const npc = createNpc(this.nextId++, npcDef, pos);
+      const safe = this.findSafePos(npcDef.pos.x, npcDef.pos.z, WATER_LEVEL + 0.6);
+      const npc = createNpc(this.nextId++, npcDef, this.groundPos(safe.x, safe.z));
       this.entities.set(npc.id, npc);
     }
 
     // Mobs from camps
     for (const camp of CAMPS) {
       const template = MOBS[camp.mobId];
+      // murlocs may wade in the shallows; everyone else spawns on dry land
+      const minHeight = template.family === 'murloc' ? WATER_LEVEL - 0.5 : WATER_LEVEL + 0.4;
       for (let i = 0; i < camp.count; i++) {
         const ang = this.rng.range(0, Math.PI * 2);
         const r = Math.sqrt(this.rng.next()) * camp.radius;
-        const pos = this.groundPos(camp.center.x + Math.sin(ang) * r, camp.center.z + Math.cos(ang) * r);
+        const safe = this.findSafePos(camp.center.x + Math.sin(ang) * r, camp.center.z + Math.cos(ang) * r, minHeight);
+        const pos = this.groundPos(safe.x, safe.z);
         const level = this.rng.int(template.minLevel, template.maxLevel);
         const mob = createMob(this.nextId++, template, level, pos);
         mob.facing = this.rng.range(-Math.PI, Math.PI);
@@ -397,6 +407,27 @@ export class Sim {
     return { x, y: groundHeight(x, z, this.cfg.seed), z };
   }
 
+  // Deterministic outward spiral to the nearest spot that is on dry-enough
+  // ground and not inside a building/prop. Keeps NPCs out of houses and lakes.
+  findSafePos(x: number, z: number, minHeight: number): { x: number; z: number } {
+    const seed = this.cfg.seed;
+    const ok = (px: number, pz: number): boolean => {
+      if (groundHeight(px, pz, seed) < minHeight) return false;
+      const res = resolvePosition(seed, px, pz, 0.6);
+      return Math.abs(res.x - px) < 1e-4 && Math.abs(res.z - pz) < 1e-4;
+    };
+    if (ok(x, z)) return { x, z };
+    const GOLDEN = 2.39996; // radians; even angular coverage
+    for (let i = 1; i <= 80; i++) {
+      const r = 0.9 * Math.sqrt(i) * 2.2;
+      const a = i * GOLDEN;
+      const px = x + Math.sin(a) * r;
+      const pz = z + Math.cos(a) * r;
+      if (ok(px, pz)) return { x: px, z: pz };
+    }
+    return { x, z };
+  }
+
   emit(ev: SimEvent): void {
     this.events.push(ev);
   }
@@ -459,6 +490,7 @@ export class Sim {
       if (!p) continue;
       if (!p.dead) {
         this.updatePlayerMovement(p, meta);
+        this.updateDoorTriggers(p);
         this.updateCasting(p, meta);
         this.updatePlayerAutoAttack(p, meta);
         this.updateRegen(p, meta);
@@ -522,7 +554,8 @@ export class Sim {
   }
 
   isSwimming(e: Entity): boolean {
-    return groundHeight(e.pos.x, e.pos.z, this.cfg.seed) < WATER_LEVEL - 0.8;
+    return groundHeight(e.pos.x, e.pos.z, this.cfg.seed) < WATER_LEVEL - SWIM_DEPTH
+      && e.pos.y <= SWIM_SURFACE_Y + 0.15;
   }
 
   private updatePlayerMovement(p: Entity, meta: PlayerMeta): void {
@@ -552,22 +585,43 @@ export class Sim {
       mx /= len; mz /= len;
       let speed = RUN_SPEED * this.moveSpeedMult(p);
       if (mz < 0) speed *= BACKPEDAL_MULT;
-      if (swimming) speed *= 0.6;
+      if (swimming) speed *= SWIM_SPEED_MULT;
       // world = forward * mz + right * mx, with right = (-cos f, sin f)
       const sin = Math.sin(p.facing), cos = Math.cos(p.facing);
       const wx = mz * sin - mx * cos;
       const wz = mz * cos + mx * sin;
-      p.pos.x += wx * speed * DT;
-      p.pos.z += wz * speed * DT;
+      let nx = p.pos.x + wx * speed * DT;
+      let nz = p.pos.z + wz * speed * DT;
+      // cliffs and the world rim are walls, not ramps
+      if (p.onGround && !swimming) {
+        const h0 = groundHeight(p.pos.x, p.pos.z, this.cfg.seed);
+        const h1 = groundHeight(nx, nz, this.cfg.seed);
+        const run = Math.hypot(nx - p.pos.x, nz - p.pos.z);
+        if (h1 > h0 && run > 1e-5 && (h1 - h0) / run > MAX_CLIMB_SLOPE) {
+          nx = p.pos.x;
+          nz = p.pos.z;
+        }
+      }
+      // slide along buildings, trees, crypt walls
+      const resolved = resolvePosition(this.cfg.seed, nx, nz, BODY_RADIUS);
+      p.pos.x = resolved.x;
+      p.pos.z = resolved.z;
     }
 
-    // Jumping, gravity, swimming, fall damage
+    // Vertical: jumping, gravity, swimming, fall damage
     const ground = groundHeight(p.pos.x, p.pos.z, this.cfg.seed);
-    if (swimming) {
-      p.pos.y = WATER_LEVEL - 0.8;
+    const deepWater = ground < WATER_LEVEL - SWIM_DEPTH;
+    if (deepWater && p.pos.y <= SWIM_SURFACE_Y + 0.05) {
+      // treading water at the surface
+      p.pos.y = SWIM_SURFACE_Y;
       p.vy = 0;
       p.onGround = true;
       p.fallStartY = p.pos.y;
+      if (inp.jump && !this.isRooted(p)) {
+        // small hop to climb onto shores and docks
+        p.vy = JUMP_VELOCITY * 0.7;
+        p.onGround = false;
+      }
       return;
     }
     if (inp.jump && p.onGround && !this.isRooted(p)) {
@@ -579,6 +633,14 @@ export class Sim {
       p.vy -= GRAVITY * DT;
       p.pos.y += p.vy * DT;
       p.fallStartY = Math.max(p.fallStartY, p.pos.y);
+      if (deepWater && p.pos.y <= SWIM_SURFACE_Y) {
+        // splashing into deep water breaks the fall
+        p.pos.y = SWIM_SURFACE_Y;
+        p.vy = 0;
+        p.onGround = true;
+        p.fallStartY = p.pos.y;
+        return;
+      }
       if (p.pos.y <= ground) {
         p.pos.y = ground;
         p.vy = 0;
@@ -667,6 +729,7 @@ export class Sim {
         if (a.tickTimer <= 0) {
           a.tickTimer += a.tickInterval;
           if (a.kind === 'dot') {
+            this.emit({ type: 'spellfx', sourceId: a.sourceId, targetId: e.id, school: a.school, fx: 'tick' });
             this.dealDamage(this.entities.get(a.sourceId) ?? null, e, a.value, false, a.school, a.name, 'hit', true);
             if (e.dead) return;
           } else if (a.kind === 'hot') {
@@ -863,6 +926,7 @@ export class Sim {
   private applyChannelTick(p: Entity, res: ResolvedAbility): void {
     const target = p.targetId !== null ? this.entities.get(p.targetId) : null;
     if (!target || target.dead) { this.cancelCast(p); return; }
+    this.emit({ type: 'spellfx', sourceId: p.id, targetId: target.id, school: res.def.school, fx: 'projectile' });
     for (const eff of res.effects) {
       if (eff.type === 'directDamage') {
         const crit = this.rng.chance(this.spellCrit(p));
@@ -929,6 +993,7 @@ export class Sim {
     if (target && ability.school !== 'physical') {
       this.spendResource(p, res.cost);
       if (ability.cooldown > 0) p.cooldowns.set(ability.id, ability.cooldown);
+      this.emit({ type: 'spellfx', sourceId: p.id, targetId: target.id, school: ability.school, fx: 'projectile' });
       if (!this.rng.chance(spellHitChance(p.level, target.level))) {
         this.emit({ type: 'damage', sourceId: p.id, targetId: target.id, amount: 0, crit: false, school: ability.school, ability: ability.name, kind: 'miss' });
         this.enterCombat(p, target);
@@ -1127,6 +1192,7 @@ export class Sim {
           break;
         }
         case 'aoeDamage': {
+          this.emit({ type: 'spellfx', sourceId: p.id, targetId: p.id, school: ability.school, fx: 'nova' });
           for (const m of this.mobsInRadius(p.pos, eff.radius)) {
             let dmg = this.rng.range(eff.min, eff.max);
             dmg *= 1 - armorReduction(m.stats.armor, p.level);
@@ -1146,6 +1212,7 @@ export class Sim {
           break;
         }
         case 'aoeRoot': {
+          this.emit({ type: 'spellfx', sourceId: p.id, targetId: p.id, school: ability.school, fx: 'nova' });
           for (const m of this.mobsInRadius(p.pos, eff.radius)) {
             const dmg = this.rng.range(eff.min, eff.max);
             this.dealDamage(p, m, Math.round(dmg), false, ability.school, ability.name, 'hit');
@@ -1298,6 +1365,7 @@ export class Sim {
   }
 
   private rangedSwing(attacker: Entity, target: Entity, ranged: { min: number; max: number; speed: number }): void {
+    this.emit({ type: 'spellfx', sourceId: attacker.id, targetId: target.id, school: 'physical', fx: 'projectile' });
     const missChance = meleeMissChance(attacker.level, target.level);
     if (this.rng.chance(missChance)) {
       this.emit({ type: 'damage', sourceId: attacker.id, targetId: target.id, amount: 0, crit: false, school: 'physical', ability: 'Auto Shot', kind: 'miss' });
@@ -1708,6 +1776,7 @@ export class Sim {
           mob.pulseTimer -= DT;
           if (mob.pulseTimer <= 0) {
             mob.pulseTimer = pulse.every;
+            this.emit({ type: 'spellfx', sourceId: mob.id, targetId: mob.id, school: 'shadow', fx: 'nova' });
             for (const meta of this.players.values()) {
               const pe = this.entities.get(meta.entityId);
               if (pe && !pe.dead && dist2d(pe.pos, mob.pos) <= pulse.radius) {
@@ -1766,9 +1835,17 @@ export class Sim {
     if (d < 0.3) return true;
     e.facing = angleTo(e.pos, dest);
     const step = Math.min(speed * DT, d);
-    e.pos.x += Math.sin(e.facing) * step;
-    e.pos.z += Math.cos(e.facing) * step;
-    e.pos.y = groundHeight(e.pos.x, e.pos.z, this.cfg.seed);
+    const nx = e.pos.x + Math.sin(e.facing) * step;
+    const nz = e.pos.z + Math.cos(e.facing) * step;
+    const ground = groundHeight(nx, nz, this.cfg.seed);
+    const canSwim = MOBS[e.templateId]?.family === 'murloc';
+    // landlocked creatures stop at the waterline instead of walking under it
+    if (!canSwim && ground < WATER_LEVEL - SWIM_DEPTH) return false;
+    const resolved = resolvePosition(this.cfg.seed, nx, nz, BODY_RADIUS);
+    e.pos.x = resolved.x;
+    e.pos.z = resolved.z;
+    const g = groundHeight(e.pos.x, e.pos.z, this.cfg.seed);
+    e.pos.y = canSwim && g < WATER_LEVEL - SWIM_DEPTH ? SWIM_SURFACE_Y : g;
     return d - step < 0.3;
   }
 
@@ -2584,6 +2661,35 @@ export class Sim {
   private instanceKeyFor(pid: number): string {
     const party = this.partyOf(pid);
     return party ? `party:${party.id}` : `solo:${pid}`;
+  }
+
+  // Walking into a dungeon door teleports you through it (no click needed).
+  // Party members who walk in land in the same instance via instanceKeyFor.
+  private cryptDoorId: number | null = null;
+
+  private updateDoorTriggers(p: Entity): void {
+    if (p.kind !== 'player') return;
+    if (p.pos.x > DUNGEON_X_THRESHOLD) {
+      // inside: walking into the exit portal climbs back out
+      for (const inst of this.instances) {
+        if (inst.exitId === null) continue;
+        const exit = this.entities.get(inst.exitId);
+        if (exit && dist2d(p.pos, exit.pos) < DOOR_TRIGGER_RADIUS) {
+          this.leaveCrypt(p.id);
+          return;
+        }
+      }
+      return;
+    }
+    if (this.cryptDoorId === null) {
+      for (const e of this.entities.values()) {
+        if (e.templateId === 'crypt_door') { this.cryptDoorId = e.id; break; }
+      }
+    }
+    const door = this.cryptDoorId !== null ? this.entities.get(this.cryptDoorId) : null;
+    if (door && dist2d(p.pos, door.pos) < DOOR_TRIGGER_RADIUS) {
+      this.enterCrypt(p.id);
+    }
   }
 
   enterCrypt(pid?: number): void {

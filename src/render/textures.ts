@@ -183,7 +183,7 @@ export function skyTexture(): THREE.CanvasTexture {
   c.height = 256;
   const ctx = c.getContext('2d')!;
   const g = ctx.createLinearGradient(0, 0, 0, 256);
-  g.addColorStop(0.0, '#3a72b8');
+  g.addColorStop(0.0, '#4f86c6');
   g.addColorStop(0.45, '#7eb2e4');
   g.addColorStop(0.62, '#aacdec');
   g.addColorStop(0.75, '#cfe4f2');

@@ -3,6 +3,7 @@ import { Renderer } from './render/renderer';
 import { Input } from './game/input';
 import { Hud } from './ui/hud';
 import { audio } from './game/audio';
+import { music } from './game/music';
 import { Api, ClientWorld, CharacterSummary } from './net/online';
 import type { IWorld } from './world_api';
 import { DT, INTERACT_RANGE, PlayerClass, dist2d } from './sim/types';
@@ -99,9 +100,9 @@ function startGame(world: IWorld, offlineSim: Sim | null, online: ClientWorld | 
     if (e.kind !== 'object') world.targetEntity(id);
     if (button === 2) {
       const d = dist2d(world.player.pos, e.pos);
-      if (e.kind === 'player' && id !== world.playerId) {
-        hud.openContextMenu(id, e.name, x, y);
-      } else if (e.kind === 'object') {
+      // players: right-click only targets — the interaction menu lives on the
+      // target portrait (right-click it), like classic WoW unit frames
+      if (e.kind === 'object') {
         if (d > INTERACT_RANGE + 1) { hud.showError('Too far away.'); return; }
         if (e.templateId === 'crypt_door') world.enterCrypt();
         else if (e.templateId === 'crypt_exit') world.leaveCrypt();
@@ -250,6 +251,7 @@ function fatalOverlay(message: string): void {
 
 function enterWorld(c: CharacterSummary): void {
   audio.init();
+  music.init();
   const world = new ClientWorld(api.token!, c.id, c.class);
   world.onDisconnect = (reason) => fatalOverlay(reason);
   // wait for hello + first snapshot so the world starts populated
@@ -278,6 +280,7 @@ function wireStartScreens(): void {
   document.querySelectorAll('.class-card').forEach((card) => {
     card.addEventListener('click', () => {
       audio.init();
+      music.init();
       const name = ($('#char-name') as unknown as HTMLInputElement).value.trim().slice(0, 16) || 'Adventurer';
       startOffline((card as HTMLElement).dataset.class as PlayerClass, name);
     });

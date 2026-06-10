@@ -1,0 +1,194 @@
+import { describe, expect, it } from 'vitest';
+import { Sim } from '../src/sim/sim';
+import { dist2d } from '../src/sim/types';
+import { CRYPT_DOOR_POS, DUNGEON_X_THRESHOLD, LAKE, MOBS } from '../src/sim/data';
+import { groundHeight, WATER_LEVEL } from '../src/sim/world';
+import { isBlocked, resolvePosition } from '../src/sim/colliders';
+
+const SEED = 20061;
+
+function makeSim(cls: 'warrior' | 'mage' = 'warrior') {
+  return new Sim({ seed: SEED, playerClass: cls });
+}
+
+function teleportTo(sim: Sim, x: number, z: number, pid?: number) {
+  const p = sim.entities.get(pid ?? sim.playerId)!;
+  p.pos.x = x;
+  p.pos.z = z;
+  p.pos.y = groundHeight(x, z, sim.cfg.seed);
+  p.prevPos = { ...p.pos };
+}
+
+describe('quest lifecycle', () => {
+  it('a turned-in quest cannot be accepted again', () => {
+    const sim = makeSim();
+    sim.acceptQuest('q_wolves');
+    expect(sim.questState('q_wolves')).toBe('active');
+
+    const qp = sim.questLog.get('q_wolves')!;
+    qp.counts[0] = 8;
+    qp.state = 'ready';
+
+    const redbrook = [...sim.entities.values()].find((e) => e.templateId === 'marshal_redbrook')!;
+    teleportTo(sim, redbrook.pos.x + 2, redbrook.pos.z + 2);
+    sim.turnInQuest('q_wolves');
+    expect(sim.questState('q_wolves')).toBe('done');
+    expect(sim.questLog.has('q_wolves')).toBe(false);
+
+    // attempting to take it again must be rejected
+    sim.acceptQuest('q_wolves');
+    expect(sim.questLog.has('q_wolves')).toBe(false);
+    expect(sim.questState('q_wolves')).toBe('done');
+  });
+});
+
+describe('collision & terrain', () => {
+  it('players cannot walk through town buildings', () => {
+    const sim = makeSim();
+    const p = sim.player;
+    // approach the house at (10,12) from the south and hold forward
+    teleportTo(sim, 10, 6);
+    p.facing = 0; // +z, straight at the building
+    sim.moveInput.forward = true;
+    for (let i = 0; i < 120; i++) sim.tick();
+    // blocked at the wall: never reaches the interior
+    expect(dist2d(p.pos, { x: 10, y: 0, z: 12 })).toBeGreaterThan(2.2);
+  });
+
+  it('steep rims are walls, not ramps', () => {
+    const sim = makeSim();
+    const p = sim.player;
+    teleportTo(sim, 150, 0);
+    p.facing = Math.PI / 2; // +x, toward the world rim
+    sim.moveInput.forward = true;
+    for (let i = 0; i < 400; i++) sim.tick();
+    expect(p.pos.x).toBeLessThan(170);
+  });
+
+  it('NPCs spawn on dry land outside buildings', () => {
+    const sim = makeSim();
+    for (const e of sim.entities.values()) {
+      if (e.kind !== 'npc') continue;
+      expect(groundHeight(e.pos.x, e.pos.z, SEED), `${e.name} underwater`).toBeGreaterThan(WATER_LEVEL + 0.5);
+      expect(isBlocked(SEED, e.pos.x, e.pos.z, 0.4), `${e.name} inside a prop`).toBe(false);
+    }
+  });
+
+  it('mobs spawn out of deep water (murlocs may wade)', () => {
+    const sim = makeSim();
+    for (const e of sim.entities.values()) {
+      if (e.kind !== 'mob') continue;
+      const h = groundHeight(e.pos.x, e.pos.z, SEED);
+      const min = MOBS[e.templateId].family === 'murloc' ? WATER_LEVEL - 0.55 : WATER_LEVEL + 0.35;
+      expect(h, `${e.name} at ${e.pos.x.toFixed(0)},${e.pos.z.toFixed(0)}`).toBeGreaterThan(min);
+    }
+  });
+
+  it('resolvePosition pushes points out of colliders', () => {
+    const inside = resolvePosition(SEED, 10, 12, 0.5); // house centre
+    expect(Math.abs(inside.x - 10) + Math.abs(inside.z - 12)).toBeGreaterThan(0.5);
+    const open = resolvePosition(SEED, 0, -40, 0.5); // open road
+    expect(open.x).toBe(0);
+    expect(open.z).toBe(-40);
+  });
+});
+
+describe('swimming', () => {
+  it('players float at the surface over deep water', () => {
+    const sim = makeSim();
+    const p = sim.player;
+    teleportTo(sim, LAKE.x, LAKE.z);
+    expect(groundHeight(LAKE.x, LAKE.z, SEED)).toBeLessThan(WATER_LEVEL - 0.8);
+    sim.tick();
+    expect(p.pos.y).toBeGreaterThan(WATER_LEVEL - 1.0);
+    expect(p.pos.y).toBeLessThan(WATER_LEVEL);
+    expect(sim.isSwimming(p)).toBe(true);
+  });
+
+  it('landlocked mobs refuse to chase into deep water', () => {
+    const sim = makeSim();
+    const wolf = [...sim.entities.values()].find((e) => e.templateId === 'forest_wolf')!;
+    // park a chase target in the middle of the lake
+    const p = sim.player;
+    teleportTo(sim, LAKE.x, LAKE.z);
+    wolf.aiState = 'chase';
+    wolf.aggroTargetId = p.id;
+    wolf.pos = { ...sim.groundPos(LAKE.x + 24, LAKE.z + 24) };
+    wolf.spawnPos = { ...wolf.pos };
+    for (let i = 0; i < 100; i++) sim.tick();
+    expect(groundHeight(wolf.pos.x, wolf.pos.z, SEED)).toBeGreaterThan(WATER_LEVEL - 0.8);
+  });
+});
+
+describe('the Hollow Crypt doors', () => {
+  it('walking into the door teleports you inside; walking into the exit brings you back', () => {
+    const sim = makeSim();
+    const p = sim.player;
+    teleportTo(sim, CRYPT_DOOR_POS.x, CRYPT_DOOR_POS.z - 1.2);
+    sim.tick();
+    expect(p.pos.x).toBeGreaterThan(DUNGEON_X_THRESHOLD);
+
+    // the exit portal sits 6yd behind the entry point — walk into it
+    const exit = [...sim.entities.values()].find((e) => e.templateId === 'crypt_exit')!;
+    p.pos.x = exit.pos.x;
+    p.pos.z = exit.pos.z + 1.2;
+    p.facing = Math.PI;
+    sim.tick();
+    expect(p.pos.x).toBeLessThan(DUNGEON_X_THRESHOLD);
+    expect(dist2d(p.pos, { x: CRYPT_DOOR_POS.x, y: 0, z: CRYPT_DOOR_POS.z }) < 8).toBe(true);
+  });
+
+  it('party members who walk in share one instance', () => {
+    const sim = new Sim({ seed: SEED, playerClass: 'warrior', noPlayer: true });
+    const a = sim.addPlayer('warrior', 'Anna');
+    const b = sim.addPlayer('mage', 'Bert');
+    sim.partyInvite(b, a);
+    sim.partyAccept(b);
+    expect(sim.partyOf(a)?.members).toContain(b);
+
+    teleportTo(sim, CRYPT_DOOR_POS.x, CRYPT_DOOR_POS.z - 1, a);
+    sim.tick();
+    teleportTo(sim, CRYPT_DOOR_POS.x, CRYPT_DOOR_POS.z - 1, b);
+    sim.tick();
+
+    const ea = sim.entities.get(a)!;
+    const eb = sim.entities.get(b)!;
+    expect(ea.pos.x).toBeGreaterThan(DUNGEON_X_THRESHOLD);
+    expect(eb.pos.x).toBeGreaterThan(DUNGEON_X_THRESHOLD);
+    const slotA = sim.instanceSlotAt(ea.pos);
+    const slotB = sim.instanceSlotAt(eb.pos);
+    expect(slotA).not.toBeNull();
+    expect(slotA).toBe(slotB);
+  });
+
+  it('solo players from different groups get different instances', () => {
+    const sim = new Sim({ seed: SEED, playerClass: 'warrior', noPlayer: true });
+    const a = sim.addPlayer('warrior', 'Anna');
+    const b = sim.addPlayer('mage', 'Bert');
+    teleportTo(sim, CRYPT_DOOR_POS.x, CRYPT_DOOR_POS.z - 1, a);
+    sim.tick();
+    teleportTo(sim, CRYPT_DOOR_POS.x, CRYPT_DOOR_POS.z - 1, b);
+    sim.tick();
+    const slotA = sim.instanceSlotAt(sim.entities.get(a)!.pos);
+    const slotB = sim.instanceSlotAt(sim.entities.get(b)!.pos);
+    expect(slotA).not.toBeNull();
+    expect(slotB).not.toBeNull();
+    expect(slotA).not.toBe(slotB);
+  });
+});
+
+describe('spell visuals', () => {
+  it('hostile casts emit projectile spellfx events', () => {
+    const sim = makeSim('mage');
+    const p = sim.player;
+    const wolf = [...sim.entities.values()].find((e) => e.kind === 'mob' && e.templateId === 'forest_wolf')!;
+    teleportTo(sim, wolf.pos.x - 10, wolf.pos.z);
+    p.facing = Math.atan2(wolf.pos.x - p.pos.x, wolf.pos.z - p.pos.z);
+    sim.targetEntity(wolf.id);
+    sim.castAbility('fireball');
+    const events = [];
+    for (let i = 0; i < 60; i++) events.push(...sim.tick());
+    const fx = events.filter((e) => e.type === 'spellfx');
+    expect(fx.some((e) => e.type === 'spellfx' && e.fx === 'projectile' && e.school === 'fire')).toBe(true);
+  });
+});

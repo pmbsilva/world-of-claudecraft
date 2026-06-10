@@ -1,16 +1,19 @@
 import * as THREE from 'three';
-import { Entity } from '../sim/types';
+import { Entity, SimEvent } from '../sim/types';
 import type { IWorld } from '../world_api';
 import { terrainHeight, groundHeight, generateDecorations, roadDistance, WATER_LEVEL } from '../sim/world';
-import { WORLD_SIZE, TOWN_RADIUS, MOBS, DUNGEON_X_THRESHOLD, instanceOrigin, INSTANCE_SLOT_COUNT } from '../sim/data';
+import { WORLD_SIZE, TOWN_RADIUS, MOBS, ABILITIES, DUNGEON_X_THRESHOLD, instanceOrigin, INSTANCE_SLOT_COUNT } from '../sim/data';
 import { buildBear, buildRigFor, buildSheep, Rig } from './models';
 import { buildProps } from './props';
 import {
   barkTexture, cloudTexture, foliageTexture, grassTuftTexture, groundDetailTexture,
   skyTexture, sparkleTexture, waterNormalish,
 } from './textures';
+import { Vfx } from './vfx';
 
 const NAMEPLATE_RANGE = 55;
+// "max graphics" defaults; ?lowgfx keeps weak machines playable
+const LOW_GFX = typeof location !== 'undefined' && new URLSearchParams(location.search).has('lowgfx');
 
 interface EntityView {
   group: THREE.Group;
@@ -26,6 +29,7 @@ interface EntityView {
   markerEl: HTMLDivElement;
   sparkle?: THREE.Sprite; // ground objects
   objectMesh?: THREE.Object3D;
+  portal?: THREE.Mesh; // dungeon door swirl
 }
 
 export class Renderer {
@@ -43,53 +47,89 @@ export class Renderer {
   showNameplates = true;
   private tmpV = new THREE.Vector3();
   private sun: THREE.DirectionalLight;
+  private sunSprites: THREE.Sprite[] = [];
+  private sunDir = new THREE.Vector3();
   private clouds: THREE.Sprite[] = [];
   private water: THREE.Mesh;
   private waterTex: THREE.Texture;
   private flames: THREE.Mesh[];
   private fireLights: THREE.PointLight[];
   private time = 0;
+  vfx: Vfx;
 
   constructor(private sim: IWorld, canvas: HTMLCanvasElement, nameplateLayer: HTMLDivElement) {
     this.nameplateLayer = nameplateLayer;
-    this.webgl = new THREE.WebGLRenderer({ canvas, antialias: true });
-    this.webgl.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.webgl = new THREE.WebGLRenderer({ canvas, antialias: !LOW_GFX, powerPreference: 'high-performance' });
+    this.webgl.setPixelRatio(LOW_GFX ? 1 : Math.min(window.devicePixelRatio, 2.5));
     this.webgl.setSize(window.innerWidth, window.innerHeight);
-    this.webgl.shadowMap.enabled = true;
+    this.webgl.shadowMap.enabled = !LOW_GFX;
     this.webgl.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 700);
+    this.webgl.toneMapping = THREE.ACESFilmicToneMapping;
+    this.webgl.toneMappingExposure = 1.12;
+    this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 950);
 
-    this.scene.fog = new THREE.Fog(0xa6c6e0, 110, 360);
+    this.scene.fog = new THREE.Fog(0xa6c6e0, 130, 470);
 
     // sky dome
     const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(520, 16, 12),
+      new THREE.SphereGeometry(560, 24, 16),
       new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false, depthWrite: false }),
     );
     sky.renderOrder = -10;
     this.scene.add(sky);
 
-    const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x46603a, 0.75);
+    const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x46603a, 1.0);
     this.scene.add(hemi);
-    const sun = new THREE.DirectionalLight(0xfff0cd, 1.6);
+    const sun = new THREE.DirectionalLight(0xfff0cd, 2.2);
     sun.position.set(90, 140, 50);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
+    sun.castShadow = !LOW_GFX;
+    sun.shadow.mapSize.set(LOW_GFX ? 1024 : 4096, LOW_GFX ? 1024 : 4096);
     sun.shadow.camera.near = 30;
-    sun.shadow.camera.far = 400;
-    const S = 55;
+    sun.shadow.camera.far = 480;
+    const S = 75;
     sun.shadow.camera.left = -S;
     sun.shadow.camera.right = S;
     sun.shadow.camera.top = S;
     sun.shadow.camera.bottom = -S;
-    sun.shadow.bias = -0.0008;
+    sun.shadow.bias = -0.0006;
+    sun.shadow.normalBias = 0.02;
     this.scene.add(sun);
     this.scene.add(sun.target);
     this.sun = sun;
+    this.sunDir.copy(sun.position).normalize();
+
+    // visible sun disc + bloom halo
+    const sunCanvas = (core: boolean): THREE.CanvasTexture => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 128;
+      const ctx = c.getContext('2d')!;
+      const g = ctx.createRadialGradient(64, 64, 2, 64, 64, 64);
+      if (core) {
+        g.addColorStop(0, 'rgba(255,252,238,1)');
+        g.addColorStop(0.35, 'rgba(255,238,180,0.95)');
+        g.addColorStop(1, 'rgba(255,220,140,0)');
+      } else {
+        g.addColorStop(0, 'rgba(255,236,180,0.55)');
+        g.addColorStop(1, 'rgba(255,220,150,0)');
+      }
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 128, 128);
+      return new THREE.CanvasTexture(c);
+    };
+    for (const [tex, scale] of [[sunCanvas(true), 60], [sunCanvas(false), 190]] as const) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, transparent: true, fog: false, depthWrite: false, depthTest: false,
+        blending: THREE.AdditiveBlending,
+      }));
+      sp.scale.set(scale, scale, 1);
+      sp.renderOrder = -9;
+      this.sunSprites.push(sp);
+      this.scene.add(sp);
+    }
 
     // clouds
     const cloudTex = cloudTexture();
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < (LOW_GFX ? 10 : 20); i++) {
       const mat = new THREE.SpriteMaterial({ map: cloudTex, transparent: true, opacity: 0.85, fog: false, depthWrite: false });
       const cl = new THREE.Sprite(mat);
       const sc = 60 + Math.random() * 90;
@@ -104,8 +144,8 @@ export class Renderer {
     this.waterTex = waterNormalish();
     this.waterTex.repeat.set(30, 30);
     const waterMat = new THREE.MeshPhongMaterial({
-      color: 0x2a6a96, transparent: true, opacity: 0.78, shininess: 90,
-      specular: 0xbbddff, map: this.waterTex,
+      color: 0x2a6a96, transparent: true, opacity: 0.8, shininess: 140,
+      specular: 0xd8ecff, map: this.waterTex,
     });
     this.water = new THREE.Mesh(new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE).rotateX(-Math.PI / 2), waterMat);
     this.water.position.y = WATER_LEVEL;
@@ -128,13 +168,54 @@ export class Renderer {
     this.selectionRing.visible = false;
     this.scene.add(this.selectionRing);
 
+    // particle system: projectiles, impacts, heal glows, ambience
+    this.vfx = new Vfx(this.scene, (id, frac) => {
+      const v = this.views.get(id);
+      if (!v) return null;
+      const e = this.sim.entities.get(id);
+      const h = v.rig.height * (e?.scale ?? 1) * frac;
+      return new THREE.Vector3(v.group.position.x, v.group.position.y + h, v.group.position.z);
+    });
+    this.vfx.setViewportScale(this.webgl.domElement.clientHeight * this.webgl.getPixelRatio(), 60);
+
     for (const e of sim.entities.values()) this.createView(e);
 
     window.addEventListener('resize', () => {
       this.camera.aspect = window.innerWidth / window.innerHeight;
       this.camera.updateProjectionMatrix();
       this.webgl.setSize(window.innerWidth, window.innerHeight);
+      this.vfx.setViewportScale(this.webgl.domElement.clientHeight * this.webgl.getPixelRatio(), 60);
     });
+  }
+
+  // Visual reactions to sim events (called by the HUD for every event,
+  // including those between other players and mobs).
+  handleEvent(ev: SimEvent): void {
+    switch (ev.type) {
+      case 'spellfx':
+        if (ev.fx === 'projectile') this.vfx.projectile(ev.sourceId, ev.targetId, ev.school);
+        else if (ev.fx === 'tick') this.vfx.tick(ev.targetId, ev.school);
+        else this.vfx.nova(ev.targetId, ev.school);
+        break;
+      case 'damage':
+        // every melee/ranged swing animates the attacker for all to see
+        if (ev.school === 'physical' && ev.sourceId !== -1) this.triggerAttack(ev.sourceId);
+        if (ev.kind === 'hit' && ev.amount > 0 && ev.school === 'physical') {
+          this.vfx.meleeSpark(ev.targetId, ev.crit);
+        }
+        break;
+      case 'heal2':
+        if (ev.amount > 0 || ev.crit) this.vfx.healGlow(ev.targetId);
+        break;
+      case 'aura': {
+        const tgt = this.sim.entities.get(ev.targetId);
+        if (ev.gained && tgt?.kind === 'player') this.vfx.buffSwirl(ev.targetId);
+        break;
+      }
+      case 'levelup':
+        this.vfx.levelUpPillar(this.sim.playerId);
+        break;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -142,7 +223,7 @@ export class Renderer {
   // -------------------------------------------------------------------------
 
   private buildTerrain(): void {
-    const seg = 240;
+    const seg = LOW_GFX ? 240 : 440;
     const size = WORLD_SIZE;
     const geo = new THREE.PlaneGeometry(size, size, seg, seg);
     geo.rotateX(-Math.PI / 2);
@@ -155,8 +236,11 @@ export class Renderer {
     const dirtDark = new THREE.Color(0x73592f);
     const rock = new THREE.Color(0x7a7a72);
     const sand = new THREE.Color(0xc2b283);
+    const hazyPeak = new THREE.Color(0xa8bdd4); // world-rim mountains, atmospheric
+    const snowCap = new THREE.Color(0xedf3fa);
     const c = new THREE.Color();
     const seed = this.sim.cfg.seed;
+    const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i), z = pos.getZ(i);
       const h = terrainHeight(x, z, seed);
@@ -177,6 +261,13 @@ export class Renderer {
       if (rd < 2.0) c.lerp(dirt, 0.85);
       else if (rd < 3.4) c.lerp(dirt, 0.85 * (1 - (rd - 2.0) / 1.4));
       if (slope > 0.55) c.lerp(rock, Math.min(1, (slope - 0.55) * 2));
+      // the rim wall reads as distant sunlit peaks, not a black cliff
+      const edge = Math.max(Math.abs(x), Math.abs(z));
+      const rim = clamp01((edge - (WORLD_SIZE / 2 - 32)) / 26);
+      if (rim > 0) {
+        c.lerp(hazyPeak, rim * 0.9);
+        c.lerp(snowCap, clamp01((h - 26) / 16) * rim * 0.8);
+      }
       colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -269,7 +360,7 @@ export class Renderer {
   private buildGrass(): void {
     const seed = this.sim.cfg.seed;
     const positions: { x: number; z: number; s: number; r: number }[] = [];
-    const step = 4.5;
+    const step = LOW_GFX ? 4.5 : 3.4;
     const half = WORLD_SIZE / 2 - 16;
     let h1 = 0;
     for (let gx = -half; gx < half; gx += step) {
@@ -316,7 +407,38 @@ export class Renderer {
     let sparkle: THREE.Sprite | undefined;
     let objectMesh: THREE.Object3D | undefined;
 
-    if (e.kind === 'object') {
+    let portal: THREE.Mesh | undefined;
+    if (e.kind === 'object' && (e.templateId === 'crypt_door' || e.templateId === 'crypt_exit')) {
+      // dungeon doorway: stone arch with a swirling portal
+      const entering = e.templateId === 'crypt_door';
+      const tint = entering ? 0x9a5df0 : 0x6ab8ff;
+      rig = { body: new THREE.Group(), parts: {}, kind: 'humanoid', height: 4.6 };
+      const stone = new THREE.MeshLambertMaterial({ color: 0x6a6a72 });
+      for (const sx of [-1.5, 1.5]) {
+        const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.7, 4.4, 0.7), stone);
+        pillar.position.set(sx, 2.2, 0);
+        pillar.castShadow = true;
+        rig.body.add(pillar);
+      }
+      const lintel = new THREE.Mesh(new THREE.BoxGeometry(4.0, 0.7, 0.9), stone);
+      lintel.position.y = 4.55;
+      lintel.castShadow = true;
+      rig.body.add(lintel);
+      portal = new THREE.Mesh(
+        new THREE.CircleGeometry(1.55, 24),
+        new THREE.MeshBasicMaterial({
+          color: tint, transparent: true, opacity: 0.55, side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        }),
+      );
+      portal.position.y = 2.15;
+      portal.scale.set(1, 1.35, 1);
+      rig.body.add(portal);
+      const glow = new THREE.PointLight(tint, 9, 15, 2);
+      glow.position.y = 2.4;
+      rig.body.add(glow);
+      objectMesh = rig.body;
+    } else if (e.kind === 'object') {
       rig = { body: new THREE.Group(), parts: {}, kind: 'humanoid', height: 1.2 };
       const crate = new THREE.Mesh(
         new THREE.BoxGeometry(0.9, 0.9, 0.9),
@@ -363,7 +485,7 @@ export class Renderer {
 
     this.views.set(e.id, {
       group, rig, sheepRig: null, bearRig: null, walkPhase: 0, attackAnim: 0,
-      nameplate: np, nameEl, hpBar, hpFill, markerEl: marker, sparkle, objectMesh,
+      nameplate: np, nameEl, hpBar, hpFill, markerEl: marker, sparkle, objectMesh, portal,
     });
   }
 
@@ -381,8 +503,7 @@ export class Renderer {
   // ---------------------------------------------------------------------
 
   private builtCrypts = new Set<number>();
-  private outdoorFog = { color: 0xa6c6e0, near: 110, far: 360 };
-  private inDungeonFog = false;
+  private fogState: 'outdoor' | 'dungeon' | 'underwater' = 'outdoor';
 
   private buildCrypt(ox: number, oz: number): void {
     const g = new THREE.Group();
@@ -451,7 +572,7 @@ export class Renderer {
     this.scene.add(g);
   }
 
-  private updateDungeonAmbience(px: number): void {
+  private updateAmbience(px: number, camY: number): void {
     const inside = px > DUNGEON_X_THRESHOLD;
     if (inside) {
       // build the crypt copy the player is standing in
@@ -466,16 +587,22 @@ export class Renderer {
         }
       }
     }
-    if (inside && !this.inDungeonFog) {
-      this.inDungeonFog = true;
-      (this.scene.fog as THREE.Fog).color.setHex(0x05060a);
-      (this.scene.fog as THREE.Fog).near = 18;
-      (this.scene.fog as THREE.Fog).far = 90;
-    } else if (!inside && this.inDungeonFog) {
-      this.inDungeonFog = false;
-      (this.scene.fog as THREE.Fog).color.setHex(this.outdoorFog.color);
-      (this.scene.fog as THREE.Fog).near = this.outdoorFog.near;
-      (this.scene.fog as THREE.Fog).far = this.outdoorFog.far;
+    const desired = inside ? 'dungeon' : camY < WATER_LEVEL - 0.05 ? 'underwater' : 'outdoor';
+    if (desired === this.fogState) return;
+    this.fogState = desired;
+    const fog = this.scene.fog as THREE.Fog;
+    if (desired === 'dungeon') {
+      fog.color.setHex(0x05060a);
+      fog.near = 18;
+      fog.far = 90;
+    } else if (desired === 'underwater') {
+      fog.color.setHex(0x17506e);
+      fog.near = 2;
+      fog.far = 48;
+    } else {
+      fog.color.setHex(0xa6c6e0);
+      fog.near = 130;
+      fog.far = 470;
     }
   }
 
@@ -522,8 +649,17 @@ export class Renderer {
           v.sparkle.scale.set(pulse, pulse, 1);
           v.sparkle.material.rotation = this.time * 0.8;
         }
+        if (v.portal && vis) {
+          v.portal.rotation.z = this.time * 1.4;
+          (v.portal.material as THREE.MeshBasicMaterial).opacity = 0.45 + Math.sin(this.time * 2.2 + e.id) * 0.15;
+        }
         continue;
       }
+
+      // swimming pose: prone at the surface, stroking arms
+      const swimming = !e.dead
+        && groundHeight(e.pos.x, e.pos.z, this.sim.cfg.seed) < WATER_LEVEL - 0.8
+        && e.pos.y <= WATER_LEVEL - 0.5;
 
       // form swaps: polymorph sheep, druid bear
       const polyed = e.auras.some((a) => a.kind === 'polymorph');
@@ -588,19 +724,34 @@ export class Renderer {
       // death pose
       if (e.dead) {
         activeRig.body.rotation.z = Math.PI / 2;
+        activeRig.body.rotation.x = 0;
         activeRig.body.position.y = 0.4;
       } else {
         activeRig.body.rotation.z = 0;
+        activeRig.body.rotation.x = 0;
         activeRig.body.position.y = 0;
         if (e.castingAbility && parts.leftArm && parts.rightArm) {
           parts.leftArm.rotation.x = -2.4;
           parts.rightArm.rotation.x = -2.4;
+          this.vfx.castSparkle(e.id, ABILITIES[e.castingAbility]?.school ?? 'arcane', dt);
         }
         // sitting pose
         if (e.kind === 'player' && (e.sitting || e.consuming)) {
           activeRig.body.position.y = -0.8;
           if (parts.leftLeg) parts.leftLeg.rotation.x = -1.4;
           if (parts.rightLeg) parts.rightLeg.rotation.x = -1.4;
+        }
+        if (swimming) {
+          // prone freestyle at the surface
+          activeRig.body.rotation.x = 1.18;
+          activeRig.body.position.y = 1.0 + Math.sin(this.time * 2 + e.id) * 0.08;
+          const ph = moving ? v.walkPhase : this.time * 2.4;
+          if (parts.leftArm) parts.leftArm.rotation.x = Math.sin(ph) * 1.25 - 1.5;
+          if (parts.rightArm && v.attackAnim <= 0) parts.rightArm.rotation.x = Math.sin(ph + Math.PI) * 1.25 - 1.5;
+          if (parts.leftLeg) parts.leftLeg.rotation.x = Math.sin(ph * 2) * 0.4;
+          if (parts.rightLeg) parts.rightLeg.rotation.x = Math.sin(ph * 2 + Math.PI) * 0.4;
+          if (moving) this.vfx.swimRipple(v.group.position, dt * 3);
+          else this.vfx.swimRipple(v.group.position, dt);
         }
       }
     }
@@ -620,11 +771,16 @@ export class Renderer {
       this.selectionRing.visible = false;
     }
 
-    // fire flicker
+    // fire flicker + rising embers
     for (let i = 0; i < this.flames.length; i++) {
       const f = this.flames[i];
       const fl = 0.85 + Math.sin(this.time * 9 + i * 2.4) * 0.12 + Math.sin(this.time * 23 + i) * 0.06;
       f.scale.set(fl, fl * (1 + Math.sin(this.time * 13 + i) * 0.12), fl);
+      const mat = f.material as THREE.MeshLambertMaterial;
+      if (mat.color.r > mat.color.b) {
+        f.getWorldPosition(this.tmpV);
+        this.vfx.campfireEmber(this.tmpV, dt);
+      }
     }
     for (let i = 0; i < this.fireLights.length; i++) {
       this.fireLights[i].intensity = 11 + Math.sin(this.time * 11 + i * 1.7) * 2.5;
@@ -640,15 +796,21 @@ export class Renderer {
     this.waterTex.offset.x = this.time * 0.008;
     this.waterTex.offset.y = this.time * 0.011;
 
-    this.updateDungeonAmbience(p.pos.x);
+    this.vfx.update(dt);
 
     this.updateCamera(alpha);
+    this.updateAmbience(p.pos.x, this.camera.position.y);
     // shadow frustum follows the player
     const pv = this.views.get(p.id);
     if (pv) {
       const pp = pv.group.position;
       this.sun.position.set(pp.x + 90, pp.y + 140, pp.z + 50);
       this.sun.target.position.set(pp.x, pp.y, pp.z);
+    }
+    // sun disc rides the sky relative to the camera
+    for (const sp of this.sunSprites) {
+      sp.position.copy(this.camera.position).addScaledVector(this.sunDir, 760);
+      sp.visible = this.fogState === 'outdoor';
     }
 
     this.updateNameplates();
@@ -679,9 +841,10 @@ export class Renderer {
       const dx = e.pos.x - p.pos.x, dz = e.pos.z - p.pos.z;
       const dist = Math.sqrt(dx * dx + dz * dz);
       const isSelf = e.id === p.id;
+      const isDoor = e.templateId === 'crypt_door' || e.templateId === 'crypt_exit';
       const hidden = isSelf || dist > NAMEPLATE_RANGE
         || (e.dead && !e.lootable && e.kind === 'mob')
-        || (e.kind === 'object')
+        || (e.kind === 'object' && !isDoor)
         || (!this.showNameplates && e.kind === 'mob' && !e.dead);
       if (hidden) {
         v.nameplate.style.display = 'none';
@@ -696,7 +859,13 @@ export class Renderer {
       v.nameplate.style.display = '';
       v.nameplate.style.transform = `translate(${sx.toFixed(0)}px, ${sy.toFixed(0)}px) translate(-50%, -100%)`;
 
-      if (e.kind === 'player') {
+      if (e.kind === 'object') {
+        // dungeon doorways announce themselves
+        v.nameEl.style.color = '#c084ff';
+        v.nameEl.textContent = e.name;
+        v.hpBar.style.display = 'none';
+        v.markerEl.textContent = '';
+      } else if (e.kind === 'player') {
         // other players: friendly blue with an hp bar
         v.nameEl.style.color = '#7fb8ff';
         v.nameEl.textContent = `${e.name}`;

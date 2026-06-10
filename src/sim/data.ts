@@ -1258,8 +1258,8 @@ export const CAMPS: CampDef[] = [
   { mobId: 'wild_boar', center: { x: 80, z: -15 }, radius: 18, count: 5 },
   // Spiders: western woods
   { mobId: 'webwood_spider', center: { x: -60, z: 5 }, radius: 22, count: 7 },
-  // Murlocs: lake shore northwest
-  { mobId: 'mudfin_murloc', center: { x: -78, z: 68 }, radius: 18, count: 8 },
+  // Murlocs: lake shore northwest — camp straddles the waterline
+  { mobId: 'mudfin_murloc', center: { x: -75, z: 57 }, radius: 14, count: 8 },
   // Kobolds: mine southwest
   { mobId: 'tunnel_rat', center: { x: -82, z: -62 }, radius: 20, count: 9 },
   // Bandits: southeast camp
@@ -1341,7 +1341,7 @@ export const ROADS: { x: number; z: number }[][] = [
   [{ x: 0, z: 8 }, { x: -8, z: 30 }, { x: -15, z: 55 }, { x: -2, z: 78 }],          // north to wolves
   [{ x: 8, z: 2 }, { x: 30, z: 8 }, { x: 55, z: 12 }],                              // east to boars
   [{ x: 6, z: -6 }, { x: 30, z: -30 }, { x: 50, z: -50 }, { x: 65, z: -65 }],       // southeast to bandits
-  [{ x: -8, z: 6 }, { x: -35, z: 25 }, { x: -58, z: 48 }, { x: -68, z: 60 }],       // northwest to lake
+  [{ x: -8, z: 6 }, { x: -35, z: 25 }, { x: -58, z: 48 }, { x: -66, z: 58 }],       // northwest to lake
   [{ x: -6, z: -6 }, { x: -30, z: -28 }, { x: -55, z: -45 }, { x: -70, z: -55 }],   // southwest to mine
   [{ x: 6, z: 8 }, { x: 35, z: 35 }, { x: 60, z: 60 }, { x: 78, z: 74 }],           // northeast to ruins
 ];
@@ -1350,5 +1350,7 @@ export const WORLD_SIZE = 360; // world spans [-180, 180] in x and z
 export const TOWN_RADIUS = 26;
 export const GRAVEYARD_POS = { x: -12, z: -14 };
 export const PLAYER_START = { x: 2, z: -2 };
-export const LAKE = { x: -85, z: 80, radius: 38 }; // basin carved into the heightfield
+// Basin carved into the heightfield. Pushed to the far northwest so its
+// shoreline meets the fishing dock and the murloc camp instead of drowning them.
+export const LAKE = { x: -92, z: 88, radius: 30 };
 export const ZONE_NAME = 'Eastbrook Vale';

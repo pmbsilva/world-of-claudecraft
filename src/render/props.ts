@@ -1,8 +1,12 @@
 import * as THREE from 'three';
 import { terrainHeight } from '../sim/world';
+import {
+  BANDIT_CRATES, BUILDINGS, CAMPFIRES, DOCK, MINE, MURLOC_HUTS, RUINS, STALL, TENTS, WELL_POS,
+} from '../sim/colliders';
 import { roofTexture, wallTexture, stoneTexture } from './textures';
 
 // Static world props: buildings, tents, campfires, mine, ruins, dock, fences.
+// Placement comes from src/sim/colliders.ts so rendering and collision agree.
 
 export interface PropsResult {
   group: THREE.Group;
@@ -70,16 +74,12 @@ export function buildProps(seed: number): PropsResult {
     group.add(shadowed(g));
   }
 
-  house(10, 12, 7, 6, -0.4);
-  house(-10, 10, 6, 5, 0.5);
-  house(12, -6, 6, 7, 2.4, true); // inn
-  // chapel near graveyard
-  (function chapel() {
+  function chapel(x: number, z: number, w: number, d: number, rot: number): void {
     const g = new THREE.Group();
-    const nave = new THREE.Mesh(new THREE.BoxGeometry(5, 4, 7), wallMat);
+    const nave = new THREE.Mesh(new THREE.BoxGeometry(w, 4, d), wallMat);
     nave.position.y = 2;
     g.add(nave);
-    const roof = new THREE.Mesh(new THREE.ConeGeometry(4.6, 2.6, 4), roofMat);
+    const roof = new THREE.Mesh(new THREE.ConeGeometry(Math.max(w, d) * 0.66, 2.6, 4), roofMat);
     roof.rotation.y = Math.PI / 4;
     roof.position.y = 5.3;
     g.add(roof);
@@ -91,12 +91,17 @@ export function buildProps(seed: number): PropsResult {
     spire.position.set(0, 7.9, 2.2);
     g.add(spire);
     const door = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.2, 0.16), woodDarkMat);
-    door.position.set(0, 1.1, 3.55);
+    door.position.set(0, 1.1, d / 2 + 0.05);
     g.add(door);
-    g.position.set(-16, ground(-16, -8), -8);
-    g.rotation.y = 0.9;
+    g.position.set(x, ground(x, z), z);
+    g.rotation.y = rot;
     group.add(shadowed(g));
-  })();
+  }
+
+  for (const b of BUILDINGS) {
+    if (b.kind === 'chapel') chapel(b.x, b.z, b.w, b.d, b.rot);
+    else house(b.x, b.z, b.w, b.d, b.rot, b.kind === 'inn');
+  }
 
   // ---- market stall for Wilkes ----
   (function stall() {
@@ -121,8 +126,8 @@ export function buildProps(seed: number): PropsResult {
     const jug = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.2, 0.4, 8), new THREE.MeshLambertMaterial({ color: 0x7a9cc6 }));
     jug.position.set(0.5, 1.1, 0.2);
     g.add(jug);
-    g.position.set(-8.5, ground(-8.5, 3), 3);
-    g.rotation.y = Math.PI / 2;
+    g.position.set(STALL.x, ground(STALL.x, STALL.z), STALL.z);
+    g.rotation.y = STALL.rot;
     group.add(shadowed(g));
   })();
 
@@ -144,7 +149,7 @@ export function buildProps(seed: number): PropsResult {
     roof.rotation.y = Math.PI / 4;
     roof.position.y = 2.95;
     g.add(roof);
-    g.position.set(0, ground(0, 2), 2);
+    g.position.set(WELL_POS.x, ground(WELL_POS.x, WELL_POS.z), WELL_POS.z);
     group.add(shadowed(g));
   })();
 
@@ -213,11 +218,7 @@ export function buildProps(seed: number): PropsResult {
     g.position.set(x, y, z);
     group.add(g);
   }
-  campfire(3, -4); // town square
-  campfire(65, -65);
-  campfire(90, -90);
-  campfire(-80, -60);
-  campfire(-61, 56);
+  for (const [x, z] of CAMPFIRES) campfire(x, z);
 
   // ---- bandit tents ----
   function tent(x: number, z: number, rot: number, scale = 1): void {
@@ -234,13 +235,10 @@ export function buildProps(seed: number): PropsResult {
     g.rotation.y = rot;
     group.add(shadowed(g));
   }
-  tent(62, -61, 0.4);
-  tent(69, -69, 2.1);
-  tent(88, -86, 1.2, 1.3);
-  tent(95, -94, -0.6);
+  for (const t of TENTS) tent(t.x, t.z, t.rot, t.scale);
 
   // crates & barrels at the bandit camp
-  for (const [x, z] of [[60, -63], [66, -67], [87, -88], [93, -90], [70, -72]]) {
+  for (const [x, z] of BANDIT_CRATES) {
     const crate = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), woodMat);
     crate.position.set(x, ground(x, z) + 0.45, z);
     crate.rotation.y = (x * 13 + z * 7) % 1;
@@ -250,7 +248,7 @@ export function buildProps(seed: number): PropsResult {
   // ---- mine entrance ----
   (function mine() {
     const g = new THREE.Group();
-    const x = -88, z = -68;
+    const x = MINE.x, z = MINE.z;
     // timber portal
     for (const sx of [-1.4, 1.4]) {
       const post = new THREE.Mesh(new THREE.BoxGeometry(0.5, 3.4, 0.5), woodMat);
@@ -277,16 +275,16 @@ export function buildProps(seed: number): PropsResult {
     ore.position.set(2.8, 1.05, 1.6);
     g.add(ore);
     g.position.set(x, ground(x, z), z);
-    g.rotation.y = 0.8;
+    g.rotation.y = MINE.rot;
     group.add(shadowed(g));
   })();
 
   // ---- ruins (northeast) ----
   (function ruins() {
-    const cx = 80, cz = 78;
-    for (let i = 0; i < 7; i++) {
-      const ang = (i / 7) * Math.PI * 2;
-      const x = cx + Math.sin(ang) * 7, z = cz + Math.cos(ang) * 7;
+    const cx = RUINS.x, cz = RUINS.z;
+    for (let i = 0; i < RUINS.columns; i++) {
+      const ang = (i / RUINS.columns) * Math.PI * 2;
+      const x = cx + Math.sin(ang) * RUINS.ringR, z = cz + Math.cos(ang) * RUINS.ringR;
       const h = i % 3 === 0 ? 1.2 : 2.6 + (i % 2) * 1.2;
       const col = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.55, h, 7), stoneMat);
       col.position.set(x, ground(x, z) + h / 2, z);
@@ -311,7 +309,7 @@ export function buildProps(seed: number): PropsResult {
 
   // ---- fishing dock + hut at the lake ----
   (function dock() {
-    const x = -64, z = 60;
+    const x = DOCK.x, z = DOCK.z;
     const y = ground(x, z);
     const g = new THREE.Group();
     const planks = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.16, 7), woodMat);
@@ -323,24 +321,24 @@ export function buildProps(seed: number): PropsResult {
       g.add(post);
     }
     // hut
-    const hut = new THREE.Mesh(new THREE.BoxGeometry(3.4, 2.4, 3), wallMat);
-    hut.position.set(2.8, 1.2, 2.4);
+    const hut = new THREE.Mesh(new THREE.BoxGeometry(DOCK.hutLocal.hw * 2, 2.4, DOCK.hutLocal.hd * 2), wallMat);
+    hut.position.set(DOCK.hutLocal.x, 1.2, DOCK.hutLocal.z);
     g.add(hut);
     const hutRoof = new THREE.Mesh(new THREE.ConeGeometry(2.8, 1.6, 4), roofMat);
     hutRoof.rotation.y = Math.PI / 4;
-    hutRoof.position.set(2.8, 3.2, 2.4);
+    hutRoof.position.set(DOCK.hutLocal.x, 3.2, DOCK.hutLocal.z);
     g.add(hutRoof);
     // barrels
     const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.8, 8), woodDarkMat);
     barrel.position.set(1, 0.4, 0.5);
     g.add(barrel);
     g.position.set(x, y, z);
-    g.rotation.y = -2.2;
+    g.rotation.y = DOCK.rot;
     group.add(shadowed(g));
   })();
 
   // ---- murloc mud huts ----
-  for (const [x, z] of [[-76, 72], [-82, 64], [-72, 64]]) {
+  for (const [x, z] of MURLOC_HUTS) {
     const hut = new THREE.Mesh(new THREE.SphereGeometry(1.2, 7, 5, 0, Math.PI * 2, 0, Math.PI / 2),
       new THREE.MeshLambertMaterial({ color: 0x6e7f4e, flatShading: true }));
     hut.position.set(x, ground(x, z), z);
