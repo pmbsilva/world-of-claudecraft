@@ -15,23 +15,18 @@ import {
   skyTexture, sparkleTexture, waterNormalish,
 } from './textures';
 import { Vfx } from './vfx';
+import { GFX, initGfxTier, sharedUniforms, urlForcedTier } from './gfx';
+import { buildComposer, PostPipeline } from './post';
 
 const NAMEPLATE_RANGE = 55;
-// "max graphics" defaults; ?lowgfx keeps weak machines playable
-const LOW_GFX_FLAG = typeof location !== 'undefined' && new URLSearchParams(location.search).has('lowgfx');
-
-// Software GL (SwiftShader/llvmpipe — headless test runners, VMs) can't take
-// the full pipeline; drop to the lowgfx path automatically.
-function isSoftwareGL(webgl: THREE.WebGLRenderer): boolean {
-  try {
-    const gl = webgl.getContext();
-    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-    const name = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
-    return /swiftshader|llvmpipe|software/i.test(name);
-  } catch {
-    return false;
-  }
-}
+// lighting rig (high/ultra) — IBL supplies ambient, sun carries the key
+const HEMI_INTENSITY = 0.45;
+const SUN_INTENSITY = 2.8;
+const ENV_INTENSITY = 0.5;
+// dungeon interiors: kill the daylight so torchlight carries the scene
+const DUNGEON_SUN_INTENSITY = 0.3;
+const DUNGEON_ENV_INTENSITY = 0.15;
+const DUNGEON_HEMI_INTENSITY = 0.14;
 
 interface EntityView {
   group: THREE.Group;
@@ -64,7 +59,9 @@ export class Renderer {
   camDist = 12;
   showNameplates = true;
   private tmpV = new THREE.Vector3();
+  private tmpV2 = new THREE.Vector3();
   private sun: THREE.DirectionalLight;
+  private hemi!: THREE.HemisphereLight;
   private sky!: THREE.Mesh;
   private sunSprites: THREE.Sprite[] = [];
   private sunDir = new THREE.Vector3();
@@ -77,17 +74,20 @@ export class Renderer {
   vfx: Vfx;
 
   private lowGfx: boolean;
+  private post: PostPipeline | null = null;
+  private godRays: THREE.Sprite[] = [];
 
   constructor(private sim: IWorld, canvas: HTMLCanvasElement, nameplateLayer: HTMLDivElement) {
     this.nameplateLayer = nameplateLayer;
-    this.webgl = new THREE.WebGLRenderer({ canvas, antialias: !LOW_GFX_FLAG, powerPreference: 'high-performance' });
-    this.lowGfx = LOW_GFX_FLAG || isSoftwareGL(this.webgl);
+    this.webgl = new THREE.WebGLRenderer({ canvas, antialias: urlForcedTier() !== 'low', powerPreference: 'high-performance' });
+    initGfxTier(this.webgl); // software-GL autodetect needs the live context
+    this.lowGfx = GFX.tier === 'low';
     const LOW_GFX = this.lowGfx;
-    this.webgl.setPixelRatio(LOW_GFX ? 1 : Math.min(window.devicePixelRatio, 2.5));
+    this.webgl.setPixelRatio(Math.min(window.devicePixelRatio, GFX.pixelRatioCap));
     this.webgl.setSize(window.innerWidth, window.innerHeight);
     this.webgl.shadowMap.enabled = !LOW_GFX;
     this.webgl.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.webgl.toneMapping = THREE.ACESFilmicToneMapping;
+    this.webgl.toneMapping = THREE.ACESFilmicToneMapping; // OutputPass reads this on the composer path
     this.webgl.toneMappingExposure = 1.12;
     this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 950);
 
@@ -101,21 +101,35 @@ export class Renderer {
     this.sky.renderOrder = -10;
     this.scene.add(this.sky);
 
-    const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x46603a, 1.0);
+    // IBL: prefilter the sky dome itself so PBR materials get sky-matched
+    // ambient specular/diffuse (low keeps the flat Lambert look instead)
+    if (!LOW_GFX) {
+      const pmrem = new THREE.PMREMGenerator(this.webgl);
+      const envScene = new THREE.Scene();
+      envScene.add(this.sky.clone());
+      const envRT = pmrem.fromScene(envScene, 0.04, 0.1, 1100); // far must cover the 560u dome
+      this.scene.environment = envRT.texture;
+      this.scene.environmentIntensity = ENV_INTENSITY;
+      pmrem.dispose();
+    }
+
+    const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x46603a, LOW_GFX ? 1.0 : HEMI_INTENSITY);
     this.scene.add(hemi);
-    const sun = new THREE.DirectionalLight(0xfff0cd, 2.2);
+    this.hemi = hemi;
+    const sun = new THREE.DirectionalLight(LOW_GFX ? 0xfff0cd : 0xffedd0, LOW_GFX ? 2.2 : SUN_INTENSITY);
     sun.position.set(90, 140, 50);
     sun.castShadow = !LOW_GFX;
-    sun.shadow.mapSize.set(LOW_GFX ? 1024 : 4096, LOW_GFX ? 1024 : 4096);
+    sun.shadow.mapSize.set(GFX.shadowMap, GFX.shadowMap);
     sun.shadow.camera.near = 30;
     sun.shadow.camera.far = 480;
-    const S = 75;
+    const S = LOW_GFX ? 75 : 50; // tighter ortho = crisper shadows; follows the player
     sun.shadow.camera.left = -S;
     sun.shadow.camera.right = S;
     sun.shadow.camera.top = S;
     sun.shadow.camera.bottom = -S;
     sun.shadow.bias = -0.0006;
-    sun.shadow.normalBias = 0.02;
+    sun.shadow.normalBias = LOW_GFX ? 0.02 : 0.05;
+    sun.shadow.radius = 4;
     this.scene.add(sun);
     this.scene.add(sun.target);
     this.sun = sun;
@@ -148,6 +162,41 @@ export class Renderer {
       sp.renderOrder = -9;
       this.sunSprites.push(sp);
       this.scene.add(sp);
+    }
+
+    // god-ray shafts: elongated additive gradient sprites hanging sunward of
+    // the camera; opacity follows how directly the camera faces the sun
+    if (!LOW_GFX) {
+      const shaft = document.createElement('canvas');
+      shaft.width = 64;
+      shaft.height = 256;
+      const sctx = shaft.getContext('2d')!;
+      const gh = sctx.createLinearGradient(0, 0, 0, 256);
+      gh.addColorStop(0, 'rgba(255,240,200,0)');
+      gh.addColorStop(0.45, 'rgba(255,240,200,0.55)');
+      gh.addColorStop(0.6, 'rgba(255,240,200,0.5)');
+      gh.addColorStop(1, 'rgba(255,240,200,0)');
+      sctx.fillStyle = gh;
+      sctx.fillRect(0, 0, 64, 256);
+      const gw = sctx.createLinearGradient(0, 0, 64, 0);
+      gw.addColorStop(0, 'rgba(0,0,0,1)');
+      gw.addColorStop(0.5, 'rgba(0,0,0,0)');
+      gw.addColorStop(1, 'rgba(0,0,0,1)');
+      sctx.globalCompositeOperation = 'destination-out';
+      sctx.fillStyle = gw;
+      sctx.fillRect(0, 0, 64, 256);
+      const shaftTex = new THREE.CanvasTexture(shaft);
+      for (let i = 0; i < 3; i++) {
+        const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: shaftTex, transparent: true, opacity: 0, fog: false,
+          depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+          rotation: 0.42 + i * 0.13,
+        }));
+        sp.scale.set(26 + i * 16, 150 + i * 35, 1);
+        sp.renderOrder = -8;
+        this.godRays.push(sp);
+        this.scene.add(sp);
+      }
     }
 
     // clouds, spread over the whole zone strip
@@ -209,10 +258,14 @@ export class Renderer {
 
     for (const e of sim.entities.values()) this.createView(e);
 
+    // post chain (bloom + grade, GTAO on ultra); low renders direct
+    if (GFX.composer) this.post = buildComposer(this.webgl, this.scene, this.camera);
+
     window.addEventListener('resize', () => {
       this.camera.aspect = window.innerWidth / window.innerHeight;
       this.camera.updateProjectionMatrix();
       this.webgl.setSize(window.innerWidth, window.innerHeight);
+      this.post?.setSize(window.innerWidth, window.innerHeight);
       this.vfx.setViewportScale(this.webgl.domElement.clientHeight * this.webgl.getPixelRatio(), 60);
     });
   }
@@ -627,7 +680,10 @@ export class Renderer {
         flame.position.set(sx, 8.4, z);
         g.add(flame);
         this.flames.push(flame);
-        const light = new THREE.PointLight(0x66bbff, 10, 22, 2);
+        const light = new THREE.PointLight(0x66bbff, 10, this.lowGfx ? 22 : 30, 2);
+        // with daylight no longer leaking underground the torches carry the
+        // scene — pump them on the lit tiers
+        if (!this.lowGfx) light.userData.baseIntensity = 30;
         light.position.set(sx, 8.2, z);
         g.add(light);
         this.fireLights.push(light);
@@ -707,7 +763,8 @@ export class Renderer {
         flame.position.set(sx, 8.4, z);
         g.add(flame);
         this.flames.push(flame);
-        const light = new THREE.PointLight(0x55e08a, 10, 22, 2);
+        const light = new THREE.PointLight(0x55e08a, 10, this.lowGfx ? 22 : 30, 2);
+        if (!this.lowGfx) light.userData.baseIntensity = 30;
         light.position.set(sx, 8.2, z);
         g.add(light);
         this.fireLights.push(light);
@@ -765,6 +822,14 @@ export class Renderer {
       fog.near = 130;
       fog.far = 470;
     }
+    // interiors must not leak daylight: drop sun + sky ambient + IBL
+    // underground so the torch point lights own the scene; restore outside
+    if (!this.lowGfx) {
+      const underground = desired === 'dungeon';
+      this.sun.intensity = underground ? DUNGEON_SUN_INTENSITY : SUN_INTENSITY;
+      this.hemi.intensity = underground ? DUNGEON_HEMI_INTENSITY : HEMI_INTENSITY;
+      this.scene.environmentIntensity = underground ? DUNGEON_ENV_INTENSITY : ENV_INTENSITY;
+    }
   }
 
   // Drop the view of an entity that left the world / our interest area.
@@ -780,6 +845,7 @@ export class Renderer {
 
   sync(alpha: number, dt: number, renderFacingOverride: number | null): void {
     this.time += dt;
+    sharedUniforms.uTime.value = this.time;
     const sim = this.sim;
     const p = sim.player;
 
@@ -944,7 +1010,9 @@ export class Renderer {
       }
     }
     for (let i = 0; i < this.fireLights.length; i++) {
-      this.fireLights[i].intensity = 11 + Math.sin(this.time * 11 + i * 1.7) * 2.5;
+      const light = this.fireLights[i];
+      const base = (light.userData.baseIntensity as number | undefined) ?? 11;
+      light.intensity = base + Math.sin(this.time * 11 + i * 1.7) * 2.5 * (base / 11);
     }
 
     // clouds drift
@@ -975,9 +1043,38 @@ export class Renderer {
       sp.position.copy(this.camera.position).addScaledVector(this.sunDir, 760);
       sp.visible = this.fogState === 'outdoor';
     }
+    this.updateGodRays();
 
     this.updateNameplates();
-    this.webgl.render(this.scene, this.camera);
+    if (this.post) this.post.render();
+    else this.webgl.render(this.scene, this.camera);
+  }
+
+  // light shafts fade in as the camera turns toward the sun, outdoor only
+  private updateGodRays(): void {
+    if (this.godRays.length === 0) return;
+    const outdoor = this.fogState === 'outdoor';
+    // azimuth-only alignment — the chase cam always pitches down while the
+    // sun sits high, so a full 3D dot product would never light the shafts
+    this.camera.getWorldDirection(this.tmpV);
+    this.tmpV.y = 0;
+    this.tmpV.normalize();
+    const sunAzimuth = this.tmpV2.set(this.sunDir.x, 0, this.sunDir.z).normalize();
+    const facing = Math.max(0, this.tmpV.dot(sunAzimuth));
+    const side = this.tmpV.set(sunAzimuth.z, 0, -sunAzimuth.x); // sunAzimuth x up
+    for (let i = 0; i < this.godRays.length; i++) {
+      const sp = this.godRays[i];
+      sp.visible = outdoor;
+      if (!outdoor) continue;
+      const sway = Math.sin(this.time * 0.13 + i * 2.1) * 10;
+      // hang the shafts sunward of the camera but near eye height so they
+      // cross a third-person frame instead of floating 150u overhead
+      sp.position.copy(this.camera.position)
+        .addScaledVector(sunAzimuth, 48 + i * 26)
+        .addScaledVector(side, (i - 1) * 30 + sway);
+      sp.position.y = this.camera.position.y + 16 + i * 7;
+      sp.material.opacity = facing * facing * facing * (0.30 - i * 0.05);
+    }
   }
 
   private updateCamera(alpha: number): void {
