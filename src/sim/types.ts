@@ -405,6 +405,9 @@ export interface Entity {
   wanderTarget: Vec3 | null;
   wanderTimer: number;
   aggroTargetId: number | null;
+  /** GM character: invulnerable (dealDamage no-ops). Server-set from the
+   *  characters.is_gm column; never user-settable. */
+  gm?: boolean;
   respawnTimer: number;
   corpseTimer: number;
   lootable: boolean;

@@ -135,11 +135,18 @@ export class GameServer {
 
   // -------------------------------------------------------------------------
 
-  join(ws: WebSocket, accountId: number, characterId: number, name: string, cls: import('../src/sim/types').PlayerClass, state: import('../src/sim/sim').CharacterState | null): ClientSession | { error: string } {
+  join(ws: WebSocket, accountId: number, characterId: number, name: string, cls: import('../src/sim/types').PlayerClass, state: import('../src/sim/sim').CharacterState | null, isGm = false): ClientSession | { error: string } {
     for (const c of this.clients.values()) {
       if (c.characterId === characterId) return { error: 'character already in world' };
     }
     const pid = this.sim.addPlayer(cls, name, { state: state ?? undefined });
+    if (isGm) {
+      // GM characters: invulnerable, and always at the level cap (the row is
+      // created without state, so the first join levels them up)
+      this.sim.setGm(pid);
+      const e = this.sim.entities.get(pid);
+      if (e && e.level < 20) this.sim.setPlayerLevel(20, pid);
+    }
     const session: ClientSession = {
       ws, accountId, characterId, pid, name,
       lastSave: Date.now(), alive: true, joinedAt: Date.now(), dbSessionId: null,

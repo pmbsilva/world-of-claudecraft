@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS characters (
 );
 CREATE INDEX IF NOT EXISTS characters_account ON characters(account_id);
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS is_gm BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS play_sessions (
   id SERIAL PRIMARY KEY,
   account_id INT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -95,11 +96,12 @@ export interface CharacterRow {
   class: PlayerClass;
   level: number;
   state: CharacterState | null;
+  is_gm: boolean;
 }
 
 export async function listCharacters(accountId: number): Promise<CharacterRow[]> {
   const res = await pool.query(
-    'SELECT id, account_id, name, class, level, state FROM characters WHERE account_id = $1 ORDER BY id',
+    'SELECT id, account_id, name, class, level, state, is_gm FROM characters WHERE account_id = $1 ORDER BY id',
     [accountId],
   );
   return res.rows;
@@ -107,7 +109,7 @@ export async function listCharacters(accountId: number): Promise<CharacterRow[]>
 
 export async function getCharacter(accountId: number, characterId: number): Promise<CharacterRow | null> {
   const res = await pool.query(
-    'SELECT id, account_id, name, class, level, state FROM characters WHERE id = $1 AND account_id = $2',
+    'SELECT id, account_id, name, class, level, state, is_gm FROM characters WHERE id = $1 AND account_id = $2',
     [characterId, accountId],
   );
   return res.rows[0] ?? null;
@@ -115,7 +117,7 @@ export async function getCharacter(accountId: number, characterId: number): Prom
 
 export async function createCharacter(accountId: number, name: string, cls: PlayerClass): Promise<CharacterRow> {
   const res = await pool.query(
-    'INSERT INTO characters (account_id, name, class) VALUES ($1, $2, $3) RETURNING id, account_id, name, class, level, state',
+    'INSERT INTO characters (account_id, name, class) VALUES ($1, $2, $3) RETURNING id, account_id, name, class, level, state, is_gm',
     [accountId, name, cls],
   );
   return res.rows[0];

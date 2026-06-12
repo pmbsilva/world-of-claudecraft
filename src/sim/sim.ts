@@ -467,6 +467,13 @@ export class Sim {
     }
   }
 
+  // Mark a player as a GM: invulnerable (see dealDamage). Server-side only —
+  // set at join time from the characters.is_gm column.
+  setGm(pid?: number): void {
+    const r = this.resolve(pid);
+    if (r) r.e.gm = true;
+  }
+
   // Dev/test convenience: jump a player to a level (learns abilities, recalcs stats).
   setPlayerLevel(level: number, pid?: number): void {
     const r = this.resolve(pid);
@@ -1460,6 +1467,7 @@ export class Sim {
 
   private dealDamage(source: Entity | null, target: Entity, amount: number, crit: boolean, school: string, ability: string | null, kind: 'hit' | 'miss' | 'dodge', noRage = false): void {
     if (target.dead) return;
+    if (target.gm) return; // GM characters are invulnerable — every damage path funnels here
     amount = Math.max(0, amount);
 
     // absorb shields soak damage first

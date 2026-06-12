@@ -596,3 +596,21 @@ describe('RL interface', () => {
     expect(run()).toEqual(run());
   });
 });
+
+describe('gm characters', () => {
+  it('gm flag makes a player invulnerable through every damage path', () => {
+    const sim = makeSim('warrior');
+    sim.setGm();
+    const before = sim.player.hp;
+    (sim as any).dealDamage(null, sim.player, 9999, false, 'physical', 'Test', 'hit', true);
+    expect(sim.player.hp).toBe(before);
+    expect(sim.player.dead).toBe(false);
+  });
+
+  it('non-gm players still take damage (control)', () => {
+    const sim = makeSim('warrior');
+    const before = sim.player.hp;
+    (sim as any).dealDamage(null, sim.player, 5, false, 'physical', 'Test', 'hit', true);
+    expect(sim.player.hp).toBe(before - 5);
+  });
+});

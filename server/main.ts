@@ -207,7 +207,7 @@ async function main(): Promise<void> {
       ws.close();
       return;
     }
-    const result = game.join(ws, accountId, character.id, character.name, character.class, character.state);
+    const result = game.join(ws, accountId, character.id, character.name, character.class, character.state, character.is_gm);
     if ('error' in result) {
       ws.send(JSON.stringify({ t: 'error', error: result.error }));
       ws.close();
